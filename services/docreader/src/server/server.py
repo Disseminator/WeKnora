@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
 import logging
@@ -30,6 +31,14 @@ try:
     from charset_normalizer import from_bytes as _cn_from_bytes  # type: ignore
 except Exception:  # pragma: no cover
     _cn_from_bytes = None  # type: ignore
+
+# >>> ADDED: optional imports for tabular fallback
+try:
+    import io
+    import pandas as _pd  # type: ignore
+except Exception:  # pragma: no cover
+    _pd = None  # type: ignore
+# <<< ADDED
 
 # Surrogate range U+D800..U+DFFF are invalid Unicode scalar values and cannot be encoded to UTF-8
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
@@ -66,6 +75,88 @@ def read_text_with_fallback(file_path: str) -> str:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
+
+# >>> ADDED: helpers for tabular fallback (Excel/CSV -> text; chunking)
+def _bytes_to_text(data: bytes) -> str:
+    """Lenient UTF-8 decode with replacement (CSV fallback only)."""
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except Exception:
+        return data.decode("utf-8", errors="replace")
+
+def _tabular_bytes_to_text(file_bytes: bytes, file_type: str) -> str:
+    """Convert xlsx/xls/csv bytes to readable text (tab-separated).
+    - Requires pandas (and openpyxl for .xlsx). If missing, raise a friendly error.
+    - Excel with multiple sheets will include sheet headers.
+    """
+    if _pd is None:
+        raise RuntimeError(
+            "Excel/CSV 解析需要 pandas（以及 openpyxl 用于 .xlsx）。请安装：pip install pandas openpyxl"
+        )
+    ft = (file_type or "").lower()
+    buf = io.BytesIO(file_bytes)
+
+    if ft in ("xlsx", "xls"):
+        try:
+            excel = _pd.ExcelFile(buf)
+        except Exception as e:
+            raise RuntimeError(f"读取 Excel 失败：{e}")
+        parts = []
+        for sheet in excel.sheet_names:
+            try:
+                df = excel.parse(sheet)
+                df = df.astype(str)
+                text = df.to_csv(index=False, sep="\t")
+                parts.append(f"# Sheet: {sheet}\n{text}")
+            except Exception as e:
+                parts.append(f"# Sheet: {sheet}\n(解析失败：{e})")
+        return "\n\n".join(parts)
+
+    if ft == "csv":
+        try:
+            df = _pd.read_csv(buf)
+        except Exception:
+            try:
+                text = _bytes_to_text(file_bytes)
+                df = _pd.read_csv(io.StringIO(text))
+            except Exception as e:
+                raise RuntimeError(f"读取 CSV 失败：{e}")
+        df = df.astype(str)
+        return df.to_csv(index=False, sep="\t")
+
+    raise ValueError(f"不支持的表格类型：{ft}")
+
+def _split_text_into_chunks(text: str, chunk_size: int, chunk_overlap: int, separators: Optional[list]) -> list:
+    """Simple splitter: coarse split by separators then windowed chunking with overlap.
+    Defaults align with original service (size=512, overlap=50).
+    """
+    if not text:
+        return []
+    seps = separators or ["\n\n", "\n", "。"]
+    # Coarse split
+    segments = [text]
+    for sep in seps:
+        nxt = []
+        for s in segments:
+            parts = s.split(sep)
+            nxt.extend([p for p in parts if p])
+        segments = nxt if nxt else segments
+    # Windowing
+    size = max(1, int(chunk_size or 512))
+    overlap = max(0, int(chunk_overlap or 50))
+    step = max(1, size - overlap)
+    chunks = []
+    for s in segments:
+        i, n = 0, len(s)
+        while i < n:
+            chunks.append(s[i:i + size])
+            if i + size >= n:
+                break
+            i += step
+    return chunks
+# <<< ADDED
 
 # Ensure no existing handlers
 for handler in logging.root.handlers[:]:
@@ -160,11 +251,60 @@ class DocReaderServicer(docreader_pb2_grpc.DocReaderServicer):
                     vlm_config=vlm_config,
                 )
 
-                # Parse file
+                # Parse file (primary path)
                 logger.info(f"Starting file parsing process")
-                result = self.parser.parse_file(
-                    request.file_name, file_type, request.file_content, chunking_config
-                )
+                result = None
+                parser_error = None
+                try:
+                    result = self.parser.parse_file(
+                        request.file_name, file_type, request.file_content, chunking_config
+                    )
+                except NotImplementedError as e:  # >>> ADDED: capture not implemented for fallback
+                    parser_error = e
+                    logger.warning(f"Parser not implemented for type={file_type}: {e}")
+                except Exception as e:
+                    parser_error = e
+                    logger.warning(f"Parser failed for type={file_type}: {e}")
+                # <<< ADDED
+
+                # >>> ADDED: Tabular fallback for xlsx/xls/csv when parser has no result
+                _ft = (file_type or "").lower()
+                if (result is None or not getattr(result, "chunks", None)) and _ft in {"xlsx", "xls", "csv"}:
+                    try:
+                        logger.info(f"Falling back to built-in tabular parser for type={_ft}")
+                        text = _tabular_bytes_to_text(bytes(request.file_content or b""), _ft)
+                        # chunk by original defaults (512/50) and separators
+                        chunk_texts = _split_text_into_chunks(
+                            text=text,
+                            chunk_size=chunk_size,
+                            chunk_overlap=chunk_overlap,
+                            separators=separators,
+                        )
+                        # Build protobuf chunks; sanitize strings
+                        chunks_pb = []
+                        _c = to_valid_utf8_text
+                        for i, t in enumerate(chunk_texts):
+                            chunks_pb.append(
+                                Chunk(
+                                    content=_c(t),
+                                    seq=i,
+                                    start=0,
+                                    end=0,
+                                )
+                            )
+                        response = ReadResponse(chunks=chunks_pb)
+                        logger.info(f"Fallback produced {len(chunks_pb)} chunks; response size: {response.ByteSize()} bytes")
+                        return response
+                    except Exception as fe:
+                        msg = f"Tabular fallback failed for {request.file_name}: {fe}"
+                        logger.error(msg)
+                        # if parser had failed earlier, expose both for debugging
+                        if parser_error:
+                            msg = f"Parser error: {parser_error}; Fallback error: {fe}"
+                        context.set_code(grpc.StatusCode.INTERNAL)
+                        context.set_details(msg)
+                        return ReadResponse(error=msg)
+                # <<< ADDED
 
                 if not result:
                     error_msg = "Failed to parse file"
