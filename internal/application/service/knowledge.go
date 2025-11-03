@@ -1353,12 +1353,15 @@ func (s *knowledgeService) UpdateKnowledge(ctx context.Context, knowledge *types
 // isValidFileType checks if a file type is supported
 func isValidFileType(filename string) bool {
 	switch strings.ToLower(getFileType(filename)) {
-	case "pdf", "txt", "docx", "doc", "md", "markdown", "png", "jpg", "jpeg", "gif":
+	case "pdf", "txt", "docx", "doc", "md", "markdown",
+		"png", "jpg", "jpeg", "gif",
+		"xlsx", "xls", "csv":
 		return true
 	default:
 		return false
 	}
 }
+
 
 // getFileType extracts the file extension from a filename
 func getFileType(filename string) string {
