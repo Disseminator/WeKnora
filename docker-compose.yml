@@ -210,8 +210,19 @@ services:
       - "${REDIS_PORT}:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    command: redis-server --appendonly yes
     restart: always
+    networks:
+      - WeKnora-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: WeKnora-ollama
+    ports:
+      - "11434:11434"           # 暴露 Ollama API 端口
+    volumes:
+      - ollama_data:/root/.ollama  # 持久化模型数据
+    restart: unless-stopped
     networks:
       - WeKnora-network
 
@@ -244,3 +255,4 @@ volumes:
   redis_data:
   minio_data:
   neo4j-data:
+  ollama_data:
